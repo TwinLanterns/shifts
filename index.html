@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whiteboarding Shifts</title>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 15px; color: #000; background: #fff; margin: 20px; max-width: 760px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p { margin: 0 0 16px; }
+  form { margin-bottom: 6px; }
+  form label { display: inline-block; margin: 0 12px 8px 0; }
+  input, button { font: inherit; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid #000; padding: 5px 8px; text-align: left; vertical-align: top; }
+  th { background: #eee; }
+  td.day { white-space: nowrap; }
+  .msg { min-height: 18px; margin-bottom: 12px; }
+  .nav { margin: 16px 0 8px; }
+  .nav b { margin-right: 10px; }
+</style>
+</head>
+<body>
+<h1>Whiteboarding Shifts <span id="adminTag"></span></h1>
+<p>Put your name down for a shift. You can remove shifts you added from this device.</p>
+
+<form id="form" autocomplete="off">
+  <label>Name: <input id="name" maxlength="40" required size="16"></label>
+  <label>Date: <input id="date" type="date" required></label>
+  <label>From: <input id="start" type="time" required value="10:00"></label>
+  <label>To: <input id="end" type="time" required value="12:00"></label>
+  <label>Notes: <input id="notes" maxlength="140" size="24"></label>
+  <button id="submit" type="submit">Add shift</button>
+</form>
+<div class="msg" id="msg"></div>
+
+<div class="nav">
+  <b id="weekLabel">This week</b>
+  <button id="prev" type="button">&lt; Prev</button>
+  <button id="today" type="button">This week</button>
+  <button id="next" type="button">Next &gt;</button>
+</div>
+<table>
+  <thead><tr><th>Day</th><th>Name</th><th>Time</th><th>Notes</th><th></th></tr></thead>
+  <tbody id="grid"></tbody>
+</table>
+
+<script>
+// ===== CONFIG: paste from Supabase -> Project Settings -> API =====
+const SUPABASE_URL = "https://YOUR-PROJECT-REF.supabase.co";
+const SUPABASE_KEY = "YOUR-PUBLISHABLE-OR-ANON-KEY";
+// ==================================================================
+
+const $ = (id) => document.getElementById(id);
+const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+let weekOffset = 0;
+let shifts = [];
+let adminKey = null;
+
+// --- storage helpers (wrapped: storage may be unavailable) ---
+function store(kind) { try { return kind === "s" ? sessionStorage : localStorage; } catch { return null; } }
+function getTokens() {
+  try { return JSON.parse(store("l")?.getItem("ws_tokens") || "{}"); } catch { return {}; }
+}
+function saveToken(id, token) {
+  const t = getTokens(); t[id] = token;
+  try { store("l")?.setItem("ws_tokens", JSON.stringify(t)); } catch {}
+}
+function dropToken(id) {
+  const t = getTokens(); delete t[id];
+  try { store("l")?.setItem("ws_tokens", JSON.stringify(t)); } catch {}
+}
+
+// --- date helpers (local time) ---
+function ymd(d) {
+  return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0");
+}
+function weekStart(offset) {
+  const d = new Date(); d.setHours(0, 0, 0, 0);
+  const dow = (d.getDay() + 6) % 7; // Monday = 0
+  d.setDate(d.getDate() - dow + offset * 7);
+  return d;
+}
+function fmtTime(t) {
+  const [h, m] = t.split(":").map(Number);
+  const ap = h >= 12 ? "PM" : "AM";
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return h12 + ":" + String(m).padStart(2, "0") + " " + ap;
+}
+
+// --- API ---
+async function api(path, { method = "GET", body, prefer } = {}) {
+  const headers = { apikey: SUPABASE_KEY, "Content-Type": "application/json" };
+  if (prefer) headers.Prefer = prefer;
+  const res = await fetch(SUPABASE_URL + "/rest/v1/" + path, {
+    method, headers, body: body ? JSON.stringify(body) : undefined
+  });
+  if (!res.ok) {
+    let detail = "";
+    try { detail = (await res.json()).message || ""; } catch {}
+    throw new Error(detail || ("Request failed (" + res.status + ")"));
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function load() {
+  const start = weekStart(weekOffset);
+  const end = new Date(start); end.setDate(end.getDate() + 6);
+  const q = "shifts?select=id,name,shift_date,start_time,end_time,notes" +
+            "&shift_date=gte." + ymd(start) + "&shift_date=lte." + ymd(end) +
+            "&order=shift_date.asc,start_time.asc";
+  try {
+    shifts = await api(q) || [];
+    render();
+  } catch (e) {
+    setMsg("Couldn't load shifts: " + e.message, true);
+  }
+}
+
+// --- render (textContent only: user input is never parsed as HTML) ---
+function render() {
+  const start = weekStart(weekOffset);
+  const end = new Date(start); end.setDate(end.getDate() + 6);
+  const opts = { month: "short", day: "numeric" };
+  $("weekLabel").textContent = start.toLocaleDateString(undefined, opts) + " - " + end.toLocaleDateString(undefined, opts);
+
+  const tokens = getTokens();
+  const todayStr = ymd(new Date());
+  const grid = $("grid");
+  grid.replaceChildren();
+
+  const cell = (tr, text, cls) => {
+    const td = document.createElement("td");
+    if (cls) td.className = cls;
+    td.textContent = text;
+    tr.appendChild(td);
+    return td;
+  };
+
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(start); d.setDate(d.getDate() + i);
+    const key = ymd(d);
+    const label = DAYS[i] + " " + (d.getMonth() + 1) + "/" + d.getDate() + (key === todayStr ? " (today)" : "");
+    const list = shifts.filter((s) => s.shift_date === key);
+
+    if (!list.length) {
+      const tr = document.createElement("tr");
+      cell(tr, label, "day");
+      const td = cell(tr, "-");
+      td.colSpan = 4;
+      grid.appendChild(tr);
+      continue;
+    }
+    list.forEach((s, idx) => {
+      const tr = document.createElement("tr");
+      if (idx === 0) { const td = cell(tr, label, "day"); td.rowSpan = list.length; }
+      cell(tr, s.name);
+      cell(tr, fmtTime(s.start_time) + " - " + fmtTime(s.end_time));
+      cell(tr, s.notes || "");
+      const act = cell(tr, "");
+      if (tokens[s.id] || adminKey) {
+        const x = document.createElement("button");
+        x.type = "button"; x.textContent = "Remove";
+        x.addEventListener("click", () => removeShift(s));
+        act.appendChild(x);
+      }
+      grid.appendChild(tr);
+    });
+  }
+}
+
+function setMsg(text, isErr) {
+  const m = $("msg");
+  m.textContent = text;
+  m.className = "msg";
+}
+
+// --- actions ---
+async function addShift(ev) {
+  ev.preventDefault();
+  const name = $("name").value.trim();
+  const date = $("date").value;
+  const start = $("start").value;
+  const end = $("end").value;
+  const notes = $("notes").value.trim();
+
+  if (!name) return setMsg("Enter your name.", true);
+  if (!date || !start || !end) return setMsg("Pick a date, start and end time.", true);
+  if (end <= start) return setMsg("End time has to be after start time.", true);
+
+  const id = crypto.randomUUID();
+  const token = crypto.randomUUID();
+  $("submit").disabled = true;
+  try {
+    await api("shifts", {
+      method: "POST", prefer: "return=minimal",
+      body: { id, name, shift_date: date, start_time: start, end_time: end, notes: notes || null, delete_token: token }
+    });
+    saveToken(id, token);
+    try { store("l")?.setItem("ws_name", name); } catch {}
+    $("notes").value = "";
+    setMsg("Shift added.", false);
+    // jump to the week of the new shift
+    const [y, mo, da] = date.split("-").map(Number);
+    const monday = new Date(y, mo - 1, da);
+    monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+    weekOffset = Math.round((monday - weekStart(0)) / (7 * 864e5));
+    await load();
+  } catch (e) {
+    setMsg("Couldn't add shift: " + e.message, true);
+  } finally {
+    $("submit").disabled = false;
+  }
+}
+
+async function removeShift(s) {
+  if (!confirm("Remove " + s.name + "'s shift?")) return;
+  const token = getTokens()[s.id];
+  try {
+    let ok = false;
+    if (token) ok = await api("rpc/delete_shift", { method: "POST", body: { p_id: s.id, p_token: token } });
+    if (!ok && adminKey) ok = await api("rpc/admin_delete_shift", { method: "POST", body: { p_id: s.id, p_key: adminKey } });
+    if (!ok) throw new Error("not allowed");
+    dropToken(s.id);
+    setMsg("Shift removed.", false);
+    await load();
+  } catch (e) {
+    setMsg("Couldn't remove shift: " + e.message, true);
+  }
+}
+
+async function initAdmin() {
+  if (location.hash !== "#admin") return;
+  let key = null;
+  try { key = store("s")?.getItem("ws_admin"); } catch {}
+  if (!key) key = prompt("Admin key:");
+  if (!key) return;
+  try {
+    const ok = await api("rpc/admin_check", { method: "POST", body: { p_key: key } });
+    if (ok) {
+      adminKey = key;
+      try { store("s")?.setItem("ws_admin", key); } catch {}
+      $("adminTag").textContent = "(admin)";
+    } else {
+      setMsg("Wrong admin key.", true);
+    }
+  } catch (e) {
+    setMsg("Admin check failed: " + e.message, true);
+  }
+}
+
+// --- init ---
+$("date").value = ymd(new Date());
+try { $("name").value = store("l")?.getItem("ws_name") || ""; } catch {}
+$("form").addEventListener("submit", addShift);
+$("prev").addEventListener("click", () => { weekOffset--; load(); });
+$("next").addEventListener("click", () => { weekOffset++; load(); });
+$("today").addEventListener("click", () => { weekOffset = 0; load(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+setInterval(() => { if (!document.hidden) load(); }, 20000);
+
+render();
+initAdmin().then(load);
+</script>
+</body>
+</html>
